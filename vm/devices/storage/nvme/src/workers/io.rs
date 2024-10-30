@@ -14,6 +14,7 @@ use crate::queue::SubmissionQueue;
 use crate::spec;
 use crate::spec::nvm;
 use crate::workers::MAX_DATA_TRANSFER_SIZE;
+use futures::lock::Mutex;
 use futures_concurrency::future::Race;
 use guestmem::GuestMemory;
 use inspect::Inspect;
@@ -28,7 +29,6 @@ use task_control::InspectTask;
 use task_control::StopTask;
 use thiserror::Error;
 use unicycle::FuturesUnordered;
-use vmcore::interrupt::Interrupt;
 
 #[derive(Inspect)]
 pub struct IoHandler {
@@ -41,7 +41,8 @@ pub struct IoHandler {
 #[derive(Inspect)]
 pub struct IoState {
     sq: SubmissionQueue,
-    cq: CompletionQueue,
+    #[inspect(skip)]
+    cq: Arc<Mutex<CompletionQueue>>,
     #[inspect(skip)]
     namespaces: BTreeMap<u32, Arc<Namespace>>,
     #[inspect(skip)]
@@ -63,16 +64,12 @@ impl IoState {
         sq_len: u16,
         sq_tail: Arc<DoorbellRegister>,
         sq_sdb_idx_gpas: Option<ShadowDoorbell>,
-        cq_gpa: u64,
-        cq_len: u16,
-        cq_head: Arc<DoorbellRegister>,
-        cq_sdb_idx_gpas: Option<ShadowDoorbell>,
-        interrupt: Option<Interrupt>,
+        cq_in: Arc<Mutex<CompletionQueue>>,
         namespaces: BTreeMap<u32, Arc<Namespace>>,
     ) -> Self {
         Self {
             sq: SubmissionQueue::new(sq_tail, sq_gpa, sq_len, sq_sdb_idx_gpas),
-            cq: CompletionQueue::new(cq_head, interrupt, cq_gpa, cq_len, cq_sdb_idx_gpas),
+            cq: cq_in,
             namespaces,
             ios: FuturesUnordered::new(),
             io_count: 0,
@@ -155,14 +152,7 @@ impl IoHandler {
     ) -> Result<(), HandlerError> {
         loop {
             let deleting = match state.queue_state {
-                IoQueueState::Active => {
-                    // Wait for a completion to be ready. This will be necessary either
-                    // to post an immediate result or to post an IO completion. It's not
-                    // strictly necessary to start a new IO, but handling that special
-                    // case is not worth the complexity.
-                    state.cq.wait_ready(mem).await?;
-                    false
-                }
+                IoQueueState::Active => false,
                 IoQueueState::Deleting => {
                     if state.ios.is_empty() {
                         self.admin_response.send(self.sqid);
@@ -272,13 +262,16 @@ impl IoHandler {
                 cid,
                 status: spec::CompletionStatus::new().with_status(result.status.0),
             };
-            if !state.cq.write(&self.mem, completion)? {
-                assert!(deleting);
-                tracelimit::warn_ratelimited!("dropped i/o completion during queue deletion");
+
+            {
+                let mut cq = state.cq.lock().await;
+                cq.wait_ready(mem).await?;
+                if !cq.write(&self.mem, completion)? {
+                    assert!(deleting);
+                    tracelimit::warn_ratelimited!("dropped i/o completion during queue deletion");
+                }
+                cq.catch_up_evt_idx(false, state.io_count as u32, &self.mem)?;
             }
-            state
-                .cq
-                .catch_up_evt_idx(false, state.io_count as u32, &self.mem)?;
         }
         Ok(())
     }
@@ -287,10 +280,8 @@ impl IoHandler {
         &mut self,
         mem: &GuestMemory,
         state: &mut IoState,
-        sq_sdb: ShadowDoorbell,
-        cq_sdb: ShadowDoorbell,
+        sq_sdb: ShadowDoorbell
     ) {
         state.sq.update_shadow_db(mem, sq_sdb);
-        state.cq.update_shadow_db(mem, cq_sdb);
     }
 }

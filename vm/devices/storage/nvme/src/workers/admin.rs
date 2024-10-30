@@ -36,6 +36,7 @@ use pal_async::task::Task;
 use parking_lot::Mutex;
 use std::collections::btree_map;
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::future::pending;
 use std::io::Cursor;
 use std::io::Write;
@@ -133,8 +134,11 @@ struct IoCq {
     #[inspect(hex)]
     len: u16,
     interrupt: Option<u16>,
-    sqid: Option<u16>,
+    #[inspect(skip)]
+    sqids: BTreeSet<u16>,
     shadow_db_evt_idx: Option<ShadowDoorbell>,
+    #[inspect(skip)]
+    cq: Arc<futures::lock::Mutex<CompletionQueue>>,
 }
 
 impl AdminState {
@@ -492,7 +496,7 @@ impl AdminHandler {
                         .handle_get_log_page(state, &command)
                         .map(|()| Some(Default::default())),
                     spec::AdminOpcode::DOORBELL_BUFFER_CONFIG => self
-                        .handle_doorbell_buffer_config(state, &command)
+                        .handle_doorbell_buffer_config(state, &command).await
                         .map(|()| Some(Default::default())),
                     opcode => {
                         tracelimit::warn_ratelimited!(?opcode, "unsupported opcode");
@@ -520,16 +524,10 @@ impl AdminHandler {
                 let sq = &mut state.io_sqs[sqid as usize - 1];
                 let cid = sq.pending_delete_cid.take().unwrap();
                 let cqid = sq.cqid.take().unwrap();
+                assert!(state.io_cqs[cqid as usize - 1].as_ref().unwrap().sqids.contains(&cqid));
                 sq.task.stop().await;
                 sq.task.remove();
-                assert_eq!(
-                    state.io_cqs[cqid as usize - 1]
-                        .as_mut()
-                        .unwrap()
-                        .sqid
-                        .take(),
-                    Some(sqid)
-                );
+                state.io_cqs[cqid as usize - 1].as_mut().unwrap().sqids.remove(&cqid);
                 (cid, Default::default())
             }
             Event::NamespaceChange(nsid) => {
@@ -757,15 +755,16 @@ impl AdminHandler {
             .into());
         }
 
-        let interrupt = if cdw11.ien() {
+        let (interrupt, iv) = if cdw11.ien() {
             let iv = cdw11.iv();
             if iv as usize >= self.config.interrupts.len() {
                 return Err(spec::Status::INVALID_INTERRUPT_VECTOR.into());
             };
-            Some(iv)
+            (Some(self.config.interrupts[iv as usize].clone()), Some(iv))
         } else {
-            None
+            (None, None)
         };
+
         let gpa = command.dptr[0] & PAGE_MASK;
         let len0 = cdw10.qsize_z();
         if len0 == 0 || len0 >= MAX_QES || self.config.qe_sizes.lock().cqe_bits != IOCQES {
@@ -782,12 +781,23 @@ impl AdminHandler {
             ));
         }
 
+        let cq =
+        Arc::new(
+            futures::lock::Mutex::new(CompletionQueue::new(
+            self.config.doorbells[cqid as usize * 2 + 1].clone(),
+            interrupt,
+            gpa,
+            len0 + 1,
+            shadow_db_evt_idx,
+        )));
+
         *io_queue = Some(IoCq {
             gpa,
             len: len0 + 1,
-            interrupt,
-            sqid: None,
+            interrupt: iv,
+            sqids : BTreeSet::new(),
             shadow_db_evt_idx,
+            cq,
         });
         Ok(())
     }
@@ -826,13 +836,7 @@ impl AdminHandler {
             .and_then(|x| x.as_mut())
             .ok_or(spec::Status::COMPLETION_QUEUE_INVALID)?;
 
-        // Don't allow sharing completion queues. This isn't spec compliant
-        // but it simplifies the device significantly and OSes don't seem to
-        // mind. This could be fixed by having a slower path when completion
-        // queues are shared.
-        if cq.sqid.is_some() {
-            return Err(spec::Status::COMPLETION_QUEUE_INVALID.into());
-        }
+        assert!(!cq.sqids.contains(&sqid));
 
         let sq_gpa = command.dptr[0] & PAGE_MASK;
         let len0 = cdw10.qsize_z();
@@ -849,27 +853,17 @@ impl AdminHandler {
             ));
         }
 
-        cq.sqid = Some(sqid);
+        cq.sqids.insert(sqid);
         sq.cqid = Some(cqid);
         let sq_tail = self.config.doorbells[sqid as usize * 2].clone();
-        let cq_head = self.config.doorbells[cqid as usize * 2 + 1].clone();
-        let interrupt = cq
-            .interrupt
-            .map(|iv| self.config.interrupts[iv as usize].clone());
         let namespaces = self.namespaces.clone();
         let sq_len = len0 + 1;
-        let cq_gpa = cq.gpa;
-        let cq_len = cq.len;
         let state = IoState::new(
             sq_gpa,
             sq_len,
             sq_tail,
             sq.shadow_db_evt_idx,
-            cq_gpa,
-            cq_len,
-            cq_head,
-            cq.shadow_db_evt_idx,
-            interrupt,
+            cq.cq.clone(),
             namespaces,
         );
         sq.task.insert(&sq.driver, "nvme-io", state);
@@ -925,7 +919,7 @@ impl AdminHandler {
             qid: cqid,
             reason: InvalidQueueIdentifierReason::NotInUse,
         })?;
-        if active_cq.sqid.is_some() {
+        if !active_cq.sqids.is_empty() {
             return Err(spec::Status::INVALID_QUEUE_DELETION.into());
         }
 
@@ -1014,7 +1008,7 @@ impl AdminHandler {
         Ok(())
     }
 
-    fn handle_doorbell_buffer_config(
+    async fn handle_doorbell_buffer_config(
         &self,
         state: &mut AdminState,
         command: &spec::Command,
@@ -1058,13 +1052,20 @@ impl AdminHandler {
             // Data queue pairs are qid + 1, because the admin queue isn't in this vector.
             let sq_sdb =
                 ShadowDoorbell::new(sdb_base, qid as u16 + 1, true, DOORBELL_STRIDE_BITS.into());
-            let cq_sdb =
-                ShadowDoorbell::new(sdb_base, qid as u16 + 1, false, DOORBELL_STRIDE_BITS.into());
-
             sq.task.update_with(move |sq, sq_state| {
-                sq.update_shadow_db(&gm, sq_state.unwrap(), sq_sdb, cq_sdb);
+                sq.update_shadow_db(&gm, sq_state.unwrap(), sq_sdb);
             });
         }
+
+        for (qid, sq) in state.io_cqs.iter_mut().enumerate() {
+            if let Some(cq) = sq {
+                let gm = &self.config.mem;
+                let cq_sdb =
+                    ShadowDoorbell::new(sdb_base, qid as u16 + 1, false, DOORBELL_STRIDE_BITS.into());
+                cq.cq.lock().await.update_shadow_db(gm, cq_sdb);
+            }
+        }
+
         Ok(())
     }
 }
