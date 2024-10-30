@@ -836,7 +836,7 @@ impl AdminHandler {
             .and_then(|x| x.as_mut())
             .ok_or(spec::Status::COMPLETION_QUEUE_INVALID)?;
 
-        assert!(!cq.sqids.contains(&cqid));
+        assert!(!cq.sqids.contains(&sqid));
 
         let sq_gpa = command.dptr[0] & PAGE_MASK;
         let len0 = cdw10.qsize_z();
